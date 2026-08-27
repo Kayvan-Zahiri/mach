@@ -7,6 +7,7 @@
 #include <cmath>
 #include <complex>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 #include <nanobind/nanobind.h>
@@ -301,6 +302,37 @@ __device__ __forceinline__ DataType interpolate_sample(
     } else if constexpr (interpType == InterpolationType::Quadratic) {
         return interpolate_quadratic<DataType, StorageType>(channel_data, sample_idx, receive_element_idx, frame_idx, n_samples, n_frames, is_valid);
     }
+}
+
+/**
+ * @brief Load FPT consecutive frames' complex samples with one or two 128-bit
+ * vector loads and convert to FP32.
+ *
+ * Requires 16-byte alignment of `p`, which the inverted-kernel dispatcher
+ * guarantees by only engaging when n_frames is a multiple of 8 (so every
+ * row offset and frame0 offset stays 16B-aligned for both storage types).
+ */
+template<typename StorageType, int FPT>
+__device__ __forceinline__ void load_frames(const StorageType* __restrict__ p, float2 (&out)[FPT]);
+
+template<>
+__device__ __forceinline__ void load_frames<float2, 4>(const float2* __restrict__ p, float2 (&out)[4]) {
+    const float4* v = reinterpret_cast<const float4*>(p);
+    const float4 a = v[0];
+    const float4 b = v[1];
+    out[0] = make_float2(a.x, a.y);
+    out[1] = make_float2(a.z, a.w);
+    out[2] = make_float2(b.x, b.y);
+    out[3] = make_float2(b.z, b.w);
+}
+
+template<>
+__device__ __forceinline__ void load_frames<__half2, 4>(const __half2* __restrict__ p, float2 (&out)[4]) {
+    const uint4 raw = *reinterpret_cast<const uint4*>(p);
+    out[0] = __half22float2(*reinterpret_cast<const __half2*>(&raw.x));
+    out[1] = __half22float2(*reinterpret_cast<const __half2*>(&raw.y));
+    out[2] = __half22float2(*reinterpret_cast<const __half2*>(&raw.z));
+    out[3] = __half22float2(*reinterpret_cast<const __half2*>(&raw.w));
 }
 
 /**
@@ -709,6 +741,220 @@ __global__ void beamformKernel(
 }
 
 /**
+ * @brief Inverted-loop I/Q beamforming kernel (frames innermost).
+ *
+ * Restructures beamformKernel's phase 2: instead of walking the receive-element
+ * loop once per frame, each thread owns FPT consecutive frames and the element
+ * loop runs once, hoisting per-element work (sample index, bounds check,
+ * apodization, phase-rotation sincos) out of the frame dimension. The FPT
+ * frames are fetched with 128-bit vector loads into independent accumulators,
+ * converting the serial load->FMA dependency chain into ILP-rich streaming.
+ * Phase 1 (shared delay/apod table) is identical to beamformKernel.
+ *
+ * Summation order differs from beamformKernel (apodization and phase rotation
+ * are folded into one complex weight per element), so results agree to FP32
+ * rounding (~1e-6 relative), not bitwise.
+ *
+ * @tparam StorageType float2 (FP32 storage) or __half2 (FP16 storage)
+ * @tparam UseApodization Whether to apply Tukey apodization
+ * @tparam interpType NearestNeighbor or Linear (Quadratic uses beamformKernel)
+ * @tparam FPT Frames per thread (4 == one 128-bit load per tap for __half2)
+ */
+template<typename StorageType, bool UseApodization, InterpolationType interpType, int FPT>
+__global__ void beamformKernelInvIQ(
+    const StorageType* const __restrict__ channel_data,
+    __grid_constant__ const uint32_t n_frames,
+    __grid_constant__ const uint32_t n_receive_elements,
+    __grid_constant__ const uint32_t n_samples,
+    const float3* const __restrict__ rx_coords_m,
+    const float3* const __restrict__ output_voxels_xyz,
+    const float* const __restrict__ tx_arrival_delays,
+    float2* __restrict__ beamformed,
+    __grid_constant__ const float sampling_freq_hz,
+    __grid_constant__ const float inv_sound_speed_m_s,
+    __grid_constant__ const float modulation_freq_hz,
+    __grid_constant__ const float f_number,
+    __grid_constant__ const float tukey_alpha,
+    __grid_constant__ const float rx_start_s,
+    __grid_constant__ const uint64_t n_output_voxels,
+    __grid_constant__ const uint32_t receive_elements_batch_size
+) {
+    static_assert(std::is_same_v<StorageType, float2> || std::is_same_v<StorageType, __half2>,
+                  "Inverted kernel is I/Q only (float2 or __half2 storage).");
+    static_assert(interpType != InterpolationType::Quadratic,
+                  "Inverted kernel supports nearest/linear only; quadratic falls back.");
+
+    const unsigned int frame_tid = threadIdx.x;
+    const unsigned int voxel_tid = threadIdx.y;
+    const unsigned int num_frame_threads = blockDim.x;
+    const unsigned int num_voxels_per_block = blockDim.y;
+    const uint32_t receive_element_block_start_idx = blockIdx.z * receive_elements_batch_size;
+    const unsigned int receive_elements_in_batch = min(receive_elements_batch_size, n_receive_elements - receive_element_block_start_idx);
+    const uint32_t voxel_batch_idx = blockIdx.x + blockIdx.y * gridDim.x;
+    const uint64_t voxel_idx = static_cast<uint64_t>(voxel_batch_idx) * num_voxels_per_block + voxel_tid;
+
+    const float modulation_freq_rad = 2.0f * PI * modulation_freq_hz;
+
+    static __shared__ float2 voxel_tau_and_apod_weights[VOXELS_RECEIVE_ELEMENTS_BATCH_SIZE];
+
+    if (voxel_idx >= n_output_voxels) return;
+
+    const float3 voxel_xyz = output_voxels_xyz[voxel_idx];
+    const float voxel_tx_delay_s = tx_arrival_delays[voxel_idx];
+    const float aperture_radius = voxel_xyz.z / (2.0f * f_number);
+    const float aperture_radius_squared = aperture_radius * aperture_radius;
+
+    // Phase 1: identical to beamformKernel
+    for (unsigned int e = frame_tid; e < receive_elements_in_batch; e += num_frame_threads) {
+        const uint32_t receive_element_idx = receive_element_block_start_idx + e;
+        const float3 rx_coord_m = rx_coords_m[receive_element_idx];
+        voxel_tau_and_apod_weights[voxel_tid * receive_elements_in_batch + e] =
+            calculateTxRxDelayAndApodization<UseApodization>(
+                rx_coord_m, voxel_xyz, aperture_radius_squared, aperture_radius,
+                voxel_tx_delay_s, sampling_freq_hz, inv_sound_speed_m_s, tukey_alpha);
+    }
+    __syncthreads();
+
+    // Phase 2: element loop outermost, FPT frames per thread innermost
+    const uint32_t n_chunks = n_frames / FPT;
+    for (uint32_t chunk = frame_tid; chunk < n_chunks; chunk += num_frame_threads) {
+        const uint32_t frame0 = chunk * FPT;
+        float2 acc[FPT];
+        #pragma unroll
+        for (int k = 0; k < FPT; k++) acc[k] = make_float2(0.0f, 0.0f);
+
+        for (uint32_t e = 0; e < receive_elements_in_batch; e++) {
+            const float2 tau_and_weight = voxel_tau_and_apod_weights[voxel_tid * receive_elements_in_batch + e];
+            const float physical_tau_s = tau_and_weight.x;
+            const float apod_weight = tau_and_weight.y;
+            if ((physical_tau_s < 0.0f) || (apod_weight == 0.0f)) continue;
+
+            const float sample_idx = (physical_tau_s - rx_start_s) * sampling_freq_hz;
+            const uint32_t receive_element_idx = receive_element_block_start_idx + e;
+
+            // Phase rotation + apodization: once per element, folded into one
+            // complex weight (w*cos, w*sin). rot(w*s) == w*rot(s).
+            float cos_phi = 1.0f, sin_phi = 0.0f;
+            if (modulation_freq_hz != 0.0f) {
+                __sincosf(modulation_freq_rad * physical_tau_s, &sin_phi, &cos_phi);
+            }
+            const float w = UseApodization ? apod_weight : 1.0f;
+            const float cw = cos_phi * w;
+            const float sw = sin_phi * w;
+
+            float2 samp[FPT];
+            if constexpr (interpType == InterpolationType::NearestNeighbor) {
+                if ((sample_idx < -0.5f) || (sample_idx > (n_samples - 0.5f))) continue;
+                const unsigned int s0 = __float2uint_rn(sample_idx);
+                load_frames<StorageType, FPT>(
+                    channel_data + (static_cast<uint32_t>(receive_element_idx) * n_samples + s0) * n_frames + frame0,
+                    samp);
+            } else {  // Linear
+                if ((sample_idx < 0.0f) || (sample_idx > (n_samples - 1))) continue;
+                const unsigned int sample_idx_floor = __float2uint_rd(sample_idx);
+                const unsigned int sample_idx_ceil = __float2uint_ru(sample_idx);
+                const float lerp_alpha = sample_idx - (float)sample_idx_floor;
+                const uint32_t base = receive_element_idx * n_samples * n_frames + frame0;
+                float2 lo[FPT], hi[FPT];
+                load_frames<StorageType, FPT>(channel_data + base + sample_idx_floor * n_frames, lo);
+                load_frames<StorageType, FPT>(channel_data + base + sample_idx_ceil * n_frames, hi);
+                #pragma unroll
+                for (int k = 0; k < FPT; k++) samp[k] = lerp(lo[k], hi[k], lerp_alpha);
+            }
+
+            #pragma unroll
+            for (int k = 0; k < FPT; k++) {
+                acc[k].x = fmaf(samp[k].x, cw, fmaf(-samp[k].y, sw, acc[k].x));
+                acc[k].y = fmaf(samp[k].y, cw, fmaf(samp[k].x, sw, acc[k].y));
+            }
+        }
+
+        const uint64_t out_base = voxel_idx * static_cast<uint64_t>(n_frames) + frame0;
+        #pragma unroll
+        for (int k = 0; k < FPT; k++) {
+            atomicAdd(&beamformed[out_base + k].x, acc[k].x);
+            atomicAdd(&beamformed[out_base + k].y, acc[k].y);
+        }
+    }
+}
+
+/**
+ * @brief Launch the inverted-loop kernel if the configuration allows it.
+ *
+ * @return false (nothing launched) when the configuration requires the
+ * original kernel: RF data, quadratic interpolation, n_frames not a multiple
+ * of 8, or MACH_NO_INVERT set in the environment (A/B benchmarking).
+ */
+template<typename DataType, typename StorageType>
+bool _try_beamform_inverted(
+    const StorageType* d_channel_data,
+    const float3* d_rx_coords_m,
+    const float3* d_scan_coords_m,
+    const float* d_tx_arrivals_s,
+    DataType* d_out,
+    uint32_t n_receive_elements,
+    uint32_t n_samples,
+    uint64_t n_output_voxels,
+    uint32_t n_frames,
+    float f_number,
+    float rx_start_s,
+    float sampling_freq_hz,
+    float inv_sound_speed_m_s,
+    float modulation_freq_hz,
+    float tukey_alpha,
+    InterpolationType interp_type
+) {
+    if constexpr (!std::is_same_v<DataType, float2>) {
+        return false;
+    } else {
+        constexpr int FPT = 4;
+        if (interp_type == InterpolationType::Quadratic) return false;
+        if (n_frames % 8 != 0) return false;  // vector-load alignment + full FPT chunks
+        if (std::getenv("MACH_NO_INVERT") != nullptr) return false;
+        if (n_output_voxels > INT_MAX) {
+            throw std::runtime_error("Error: Number of voxels (" + std::to_string(n_output_voxels) +
+                                     ") exceeds the maximum integer value (" + std::to_string(INT_MAX) + ").");
+        }
+
+        const uint32_t n_chunks = n_frames / FPT;
+        const int frame_threads = min(static_cast<int>(n_chunks), MAX_FRAME_THREADS_PER_BLOCK);
+        const int voxels_per_block = calculate_voxels_per_block(frame_threads);
+        dim3 threads_per_block(frame_threads, voxels_per_block);
+        DEBUG_ASSERT(threads_per_block.x * threads_per_block.y <= 1024);
+        const int receive_elements_batch_size = calculate_receive_elements_batch_size(voxels_per_block);
+
+        const int num_blocks = (n_output_voxels + voxels_per_block - 1) / voxels_per_block;
+        const int max_blocks_per_dim = (1 << 16) - 32;
+        const int grid_x = min(max_blocks_per_dim, num_blocks);
+        const int grid_y = (num_blocks + grid_x - 1) / grid_x;
+        const int grid_z = (n_receive_elements + receive_elements_batch_size - 1) / receive_elements_batch_size;
+        dim3 grid(grid_x, grid_y, grid_z);
+
+        const bool apod_flag = tukey_alpha > 0.0f;
+
+#define MACH_LAUNCH_INV(APOD, INTERP)                                                      \
+        beamformKernelInvIQ<StorageType, APOD, INTERP, FPT><<<grid, threads_per_block>>>(  \
+            d_channel_data, n_frames, n_receive_elements, n_samples,                       \
+            d_rx_coords_m, d_scan_coords_m, d_tx_arrivals_s, d_out,                        \
+            sampling_freq_hz, inv_sound_speed_m_s, modulation_freq_hz,                     \
+            f_number, tukey_alpha, rx_start_s, n_output_voxels,                            \
+            receive_elements_batch_size)
+
+        if (apod_flag) {
+            if (interp_type == InterpolationType::NearestNeighbor) MACH_LAUNCH_INV(true, InterpolationType::NearestNeighbor);
+            else                                                   MACH_LAUNCH_INV(true, InterpolationType::Linear);
+        } else {
+            if (interp_type == InterpolationType::NearestNeighbor) MACH_LAUNCH_INV(false, InterpolationType::NearestNeighbor);
+            else                                                   MACH_LAUNCH_INV(false, InterpolationType::Linear);
+        }
+#undef MACH_LAUNCH_INV
+        // Wait for kernel to complete
+        checkCudaErrors(cudaDeviceSynchronize());
+        return true;
+    }
+}
+
+/**
  * @brief Beamforming function template wrapper that calls the appropriate kernel based on the data type.
  *
  * This function sets up the CUDA environment and calls the beamformKernel to perform delay-and-sum beamforming.
@@ -776,6 +1022,16 @@ void _beamform_impl(
     }
     bool apod_flag = tukey_alpha > 0.0f;
     const float inv_sound_speed_m_s = 1.0f / sound_speed_m_s;
+
+    // Inverted-loop fast path (I/Q, nearest/linear, n_frames % 8 == 0);
+    // falls through to the original kernel otherwise.
+    if (_try_beamform_inverted<DataType, StorageType>(
+            d_channel_data, d_rx_coords_m, d_scan_coords_m, d_tx_arrivals_s, d_out,
+            n_receive_elements, n_samples, n_output_voxels, n_frames,
+            f_number, rx_start_s, sampling_freq_hz, inv_sound_speed_m_s,
+            modulation_freq_hz, tukey_alpha, interp_type)) {
+        return;
+    }
 
     // Calculate block dimensions
     const int frames_per_block = min(n_frames, MAX_FRAME_THREADS_PER_BLOCK);
