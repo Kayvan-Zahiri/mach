@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <helper_cuda.h>
 #include <helper_math.h> // float2 lerp
 
@@ -92,8 +93,23 @@ struct SectionTimer {
 #endif
 
 /**
+ * @brief Convert a stored channel-data sample to the FP32 compute type.
+ *
+ * FP16 support changes only the STORAGE format of channel_data: samples are
+ * loaded as __half/__half2 and converted to float/float2 immediately, so all
+ * interpolation, apodization, phase rotation, and accumulation stay in FP32.
+ */
+template<typename ComputeType, typename StorageType>
+__device__ __forceinline__ ComputeType to_compute(StorageType v);
+template<> __device__ __forceinline__ float to_compute<float, float>(float v) { return v; }
+template<> __device__ __forceinline__ float2 to_compute<float2, float2>(float2 v) { return v; }
+template<> __device__ __forceinline__ float to_compute<float, __half>(__half v) { return __half2float(v); }
+template<> __device__ __forceinline__ float2 to_compute<float2, __half2>(__half2 v) { return __half22float2(v); }
+
+/**
  * @brief Template function for nearest neighbor interpolation with bounds checking
  * @tparam DataType Either float or float2
+ * @tparam StorageType Storage type of channel_data: DataType, or its FP16 counterpart (__half / __half2)
  * @param channel_data Pointer to sensor data
  * @param sample_idx Floating point sample index
  * @param receive_element_idx Index of receive element
@@ -103,9 +119,9 @@ struct SectionTimer {
  * @param[out] is_valid Whether the sample is within bounds
  * @return Interpolated sensor sample (undefined if is_valid is false)
  */
-template<typename DataType>
+template<typename DataType, typename StorageType = DataType>
 __device__ __forceinline__ DataType interpolate_nearest(
-    const DataType* const __restrict__ channel_data,
+    const StorageType* const __restrict__ channel_data,
     float sample_idx,
     uint32_t receive_element_idx,
     uint32_t frame_idx,
@@ -127,12 +143,13 @@ __device__ __forceinline__ DataType interpolate_nearest(
     DEBUG_ASSERT(channel_data_idx < static_cast<uint64_t>(n_samples) * n_frames * (receive_element_idx + 1));  // Verify channel data index is in bounds
 
     is_valid = true;
-    return channel_data[channel_data_idx];
+    return to_compute<DataType>(channel_data[channel_data_idx]);
 }
 
 /**
  * @brief Template function for linear interpolation with bounds checking
  * @tparam DataType Either float or float2
+ * @tparam StorageType Storage type of channel_data: DataType, or its FP16 counterpart (__half / __half2)
  * @param channel_data Pointer to sensor data
  * @param sample_idx Floating point sample index
  * @param receive_element_idx Index of receive element
@@ -142,9 +159,9 @@ __device__ __forceinline__ DataType interpolate_nearest(
  * @param[out] is_valid Whether the sample is within bounds
  * @return Interpolated sensor sample (undefined if is_valid is false)
  */
-template<typename DataType>
+template<typename DataType, typename StorageType = DataType>
 __device__ __forceinline__ DataType interpolate_linear(
-    const DataType* const __restrict__ channel_data,
+    const StorageType* const __restrict__ channel_data,
     float sample_idx,
     uint32_t receive_element_idx,
     uint32_t frame_idx,
@@ -176,12 +193,14 @@ __device__ __forceinline__ DataType interpolate_linear(
     DEBUG_ASSERT(channel_data_idx_ceil < static_cast<uint64_t>(n_samples) * n_frames * (receive_element_idx + 1));   // Verify ceil channel data index is in bounds
 
     is_valid = true;
-    return lerp(channel_data[channel_data_idx_floor], channel_data[channel_data_idx_ceil], lerp_alpha);
+    return lerp(to_compute<DataType>(channel_data[channel_data_idx_floor]),
+                to_compute<DataType>(channel_data[channel_data_idx_ceil]), lerp_alpha);
 }
 
 /**
  * @brief Template function for quadratic interpolation with bounds checking
  * @tparam DataType Either float or float2
+ * @tparam StorageType Storage type of channel_data: DataType, or its FP16 counterpart (__half / __half2)
  * @param channel_data Pointer to sensor data
  * @param sample_idx Floating point sample index
  * @param receive_element_idx Index of receive element
@@ -191,9 +210,9 @@ __device__ __forceinline__ DataType interpolate_linear(
  * @param[out] is_valid Whether the sample is within bounds
  * @return Interpolated sensor sample (undefined if is_valid is false)
  */
-template<typename DataType>
+template<typename DataType, typename StorageType = DataType>
 __device__ __forceinline__ DataType interpolate_quadratic(
-    const DataType* const __restrict__ channel_data,
+    const StorageType* const __restrict__ channel_data,
     float sample_idx,
     uint32_t receive_element_idx,
     uint32_t frame_idx,
@@ -242,9 +261,9 @@ __device__ __forceinline__ DataType interpolate_quadratic(
     const float w_1 = 0.5f * x * (x + 1.0f);         // Weight for right point (x=1)
 
     // Get the 3 data points
-    const DataType data_neg1 = channel_data[channel_data_idx_neg1];  // Left point (x=-1)
-    const DataType data_0 = channel_data[channel_data_idx_0];        // Center point (x=0)
-    const DataType data_1 = channel_data[channel_data_idx_1];        // Right point (x=1)
+    const DataType data_neg1 = to_compute<DataType>(channel_data[channel_data_idx_neg1]);  // Left point (x=-1)
+    const DataType data_0 = to_compute<DataType>(channel_data[channel_data_idx_0]);        // Center point (x=0)
+    const DataType data_1 = to_compute<DataType>(channel_data[channel_data_idx_1]);        // Right point (x=1)
 
     // Compute weighted sum using Lagrange basis
     is_valid = true;
@@ -254,6 +273,7 @@ __device__ __forceinline__ DataType interpolate_quadratic(
 /**
  * @brief Unified template function for interpolation dispatch with bounds checking
  * @tparam DataType Either float or float2
+ * @tparam StorageType Storage type of channel_data: DataType, or its FP16 counterpart (__half / __half2)
  * @tparam interpType Interpolation type (compile-time constant)
  * @param channel_data Pointer to sensor data
  * @param sample_idx Floating point sample index
@@ -264,9 +284,9 @@ __device__ __forceinline__ DataType interpolate_quadratic(
  * @param[out] is_valid Whether the sample is within bounds
  * @return Interpolated sensor sample (undefined if is_valid is false)
  */
-template<typename DataType, InterpolationType interpType>
+template<typename DataType, InterpolationType interpType, typename StorageType = DataType>
 __device__ __forceinline__ DataType interpolate_sample(
-    const DataType* const __restrict__ channel_data,
+    const StorageType* const __restrict__ channel_data,
     float sample_idx,
     uint32_t receive_element_idx,
     uint32_t frame_idx,
@@ -275,11 +295,11 @@ __device__ __forceinline__ DataType interpolate_sample(
     bool& is_valid
 ) {
     if constexpr (interpType == InterpolationType::NearestNeighbor) {
-        return interpolate_nearest<DataType>(channel_data, sample_idx, receive_element_idx, frame_idx, n_samples, n_frames, is_valid);
+        return interpolate_nearest<DataType, StorageType>(channel_data, sample_idx, receive_element_idx, frame_idx, n_samples, n_frames, is_valid);
     } else if constexpr (interpType == InterpolationType::Linear) {
-        return interpolate_linear<DataType>(channel_data, sample_idx, receive_element_idx, frame_idx, n_samples, n_frames, is_valid);
+        return interpolate_linear<DataType, StorageType>(channel_data, sample_idx, receive_element_idx, frame_idx, n_samples, n_frames, is_valid);
     } else if constexpr (interpType == InterpolationType::Quadratic) {
-        return interpolate_quadratic<DataType>(channel_data, sample_idx, receive_element_idx, frame_idx, n_samples, n_frames, is_valid);
+        return interpolate_quadratic<DataType, StorageType>(channel_data, sample_idx, receive_element_idx, frame_idx, n_samples, n_frames, is_valid);
     }
 }
 
@@ -501,6 +521,7 @@ __device__ static inline float2 calculateTxRxDelayAndApodization(
  * - Atomic operations for output accumulation across receive element batches
  *
  * @tparam DataType Either float (for RF data) or float2 (for I/Q data)
+ * @tparam StorageType Storage type of channel_data: DataType (default) or its FP16 counterpart
  * @tparam UseApodization Whether to apply Tukey window apodization
  * @tparam interpType Interpolation method for sensor data sampling
  * @param channel_data Input sensor data [n_receive_elements][n_samples][n_frames] (DataType)
@@ -520,9 +541,9 @@ __device__ static inline float2 calculateTxRxDelayAndApodization(
  * @param n_output_voxels Number of output voxels
  * @param receive_elements_batch_size Number of receive elements to process per batch
  */
-template<typename DataType, bool UseApodization, InterpolationType interpType>
+template<typename DataType, bool UseApodization, InterpolationType interpType, typename StorageType = DataType>
 __global__ void beamformKernel(
-    const DataType* const __restrict__ channel_data,
+    const StorageType* const __restrict__ channel_data,
     __grid_constant__ const uint32_t n_frames,
     __grid_constant__ const uint32_t n_receive_elements,
     __grid_constant__ const uint32_t n_samples,
@@ -539,10 +560,16 @@ __global__ void beamformKernel(
     __grid_constant__ const uint64_t n_output_voxels,
     __grid_constant__ const uint32_t receive_elements_batch_size
 ) {
-    // Ensure DataType is one of the supported types for ultrasound beamforming
-    static_assert(std::is_same_v<DataType, float> || std::is_same_v<DataType, float2>,
-                  "DataType must be float (for RF data) or float2 (for I/Q data). "
-                  "Other types like double/double2 or half/half2 would require kernel modifications.");
+    // Ensure DataType is one of the supported types for ultrasound beamforming.
+    // StorageType controls only how channel_data is stored: full precision
+    // (same as DataType) or FP16 (__half for RF, __half2 for I/Q). Compute and
+    // output stay FP32.
+    static_assert((std::is_same_v<DataType, float> &&
+                   (std::is_same_v<StorageType, float> || std::is_same_v<StorageType, __half>)) ||
+                  (std::is_same_v<DataType, float2> &&
+                   (std::is_same_v<StorageType, float2> || std::is_same_v<StorageType, __half2>)),
+                  "DataType must be float (RF) or float2 (I/Q); StorageType must be "
+                  "the same type or its FP16 counterpart (__half / __half2).");
     constexpr bool is_complex = std::is_same_v<DataType, float2>;
 
     // Calculate the base voxel index for this block
@@ -638,7 +665,7 @@ __global__ void beamformKernel(
 
             // Use template-based interpolation dispatch with unified bounds checking
             bool is_valid;
-            DataType sensor_sample = interpolate_sample<DataType, interpType>(
+            DataType sensor_sample = interpolate_sample<DataType, interpType, StorageType>(
                 channel_data, sample_idx, receive_element_idx, frame_idx, n_samples, n_frames, is_valid
             );
 
@@ -694,6 +721,7 @@ __global__ void beamformKernel(
  * - Coalesced memory access patterns
  *
  * @tparam DataType Either float (for RF data) or float2 (for I/Q data)
+ * @tparam StorageType Storage type of channel_data: DataType (default) or its FP16 counterpart
  * @param d_channel_data Device pointer to sensor data [n_receive_elements, n_samples, n_frames]
  * @param d_rx_coords_m Device pointer to receive element positions [n_receive_elements, 3]
  * @param d_scan_coords_m Device pointer to output voxel positions [n_output_voxels, 3]
@@ -711,9 +739,9 @@ __global__ void beamformKernel(
  * @param tukey_alpha Tukey window alpha for apodization (0=no apodization, 1=full apodization)
  * @param interp_type Interpolation method for sensor data sampling
  */
-template<typename DataType>
+template<typename DataType, typename StorageType = DataType>
 void _beamform_impl(
-    const DataType* d_channel_data,
+    const StorageType* d_channel_data,
     const float3* d_rx_coords_m,
     const float3* d_scan_coords_m,
     const float* d_tx_arrivals_s,
@@ -819,24 +847,24 @@ void _beamform_impl(
     // Dispatch based on apodization and interpolation type
     if (apod_flag) {
         if (interp_type == InterpolationType::NearestNeighbor) {
-            checkCudaErrors(cudaFuncSetCacheConfig(beamformKernel<DataType, true, InterpolationType::NearestNeighbor>, CACHE_CONFIG));
-            beamformKernel<DataType, true, InterpolationType::NearestNeighbor><<<grid, threads_per_block>>>(
+            checkCudaErrors(cudaFuncSetCacheConfig(beamformKernel<DataType, true, InterpolationType::NearestNeighbor, StorageType>, CACHE_CONFIG));
+            beamformKernel<DataType, true, InterpolationType::NearestNeighbor, StorageType><<<grid, threads_per_block>>>(
                 d_channel_data, n_frames, n_receive_elements, n_samples,
                 d_rx_coords_m, d_scan_coords_m, d_tx_arrivals_s, d_out,
                 sampling_freq_hz, inv_sound_speed_m_s, modulation_freq_hz,
                 f_number, tukey_alpha, rx_start_s, n_output_voxels, receive_elements_batch_size
             );
         } else if (interp_type == InterpolationType::Linear) {
-            checkCudaErrors(cudaFuncSetCacheConfig(beamformKernel<DataType, true, InterpolationType::Linear>, CACHE_CONFIG));
-            beamformKernel<DataType, true, InterpolationType::Linear><<<grid, threads_per_block>>>(
+            checkCudaErrors(cudaFuncSetCacheConfig(beamformKernel<DataType, true, InterpolationType::Linear, StorageType>, CACHE_CONFIG));
+            beamformKernel<DataType, true, InterpolationType::Linear, StorageType><<<grid, threads_per_block>>>(
                 d_channel_data, n_frames, n_receive_elements, n_samples,
                 d_rx_coords_m, d_scan_coords_m, d_tx_arrivals_s, d_out,
                 sampling_freq_hz, inv_sound_speed_m_s, modulation_freq_hz,
                 f_number, tukey_alpha, rx_start_s, n_output_voxels, receive_elements_batch_size
             );
         } else { // Quadratic interpolation
-            checkCudaErrors(cudaFuncSetCacheConfig(beamformKernel<DataType, true, InterpolationType::Quadratic>, CACHE_CONFIG));
-            beamformKernel<DataType, true, InterpolationType::Quadratic><<<grid, threads_per_block>>>(
+            checkCudaErrors(cudaFuncSetCacheConfig(beamformKernel<DataType, true, InterpolationType::Quadratic, StorageType>, CACHE_CONFIG));
+            beamformKernel<DataType, true, InterpolationType::Quadratic, StorageType><<<grid, threads_per_block>>>(
                 d_channel_data, n_frames, n_receive_elements, n_samples,
                 d_rx_coords_m, d_scan_coords_m, d_tx_arrivals_s, d_out,
                 sampling_freq_hz, inv_sound_speed_m_s, modulation_freq_hz,
@@ -845,24 +873,24 @@ void _beamform_impl(
         }
     } else {
         if (interp_type == InterpolationType::NearestNeighbor) {
-            checkCudaErrors(cudaFuncSetCacheConfig(beamformKernel<DataType, false, InterpolationType::NearestNeighbor>, CACHE_CONFIG));
-            beamformKernel<DataType, false, InterpolationType::NearestNeighbor><<<grid, threads_per_block>>>(
+            checkCudaErrors(cudaFuncSetCacheConfig(beamformKernel<DataType, false, InterpolationType::NearestNeighbor, StorageType>, CACHE_CONFIG));
+            beamformKernel<DataType, false, InterpolationType::NearestNeighbor, StorageType><<<grid, threads_per_block>>>(
                 d_channel_data, n_frames, n_receive_elements, n_samples,
                 d_rx_coords_m, d_scan_coords_m, d_tx_arrivals_s, d_out,
                 sampling_freq_hz, inv_sound_speed_m_s, modulation_freq_hz,
                 f_number, tukey_alpha, rx_start_s, n_output_voxels, receive_elements_batch_size
             );
         } else if (interp_type == InterpolationType::Linear) {
-            checkCudaErrors(cudaFuncSetCacheConfig(beamformKernel<DataType, false, InterpolationType::Linear>, CACHE_CONFIG));
-            beamformKernel<DataType, false, InterpolationType::Linear><<<grid, threads_per_block>>>(
+            checkCudaErrors(cudaFuncSetCacheConfig(beamformKernel<DataType, false, InterpolationType::Linear, StorageType>, CACHE_CONFIG));
+            beamformKernel<DataType, false, InterpolationType::Linear, StorageType><<<grid, threads_per_block>>>(
                 d_channel_data, n_frames, n_receive_elements, n_samples,
                 d_rx_coords_m, d_scan_coords_m, d_tx_arrivals_s, d_out,
                 sampling_freq_hz, inv_sound_speed_m_s, modulation_freq_hz,
                 f_number, tukey_alpha, rx_start_s, n_output_voxels, receive_elements_batch_size
             );
         } else { // Quadratic interpolation
-            checkCudaErrors(cudaFuncSetCacheConfig(beamformKernel<DataType, false, InterpolationType::Quadratic>, CACHE_CONFIG));
-            beamformKernel<DataType, false, InterpolationType::Quadratic><<<grid, threads_per_block>>>(
+            checkCudaErrors(cudaFuncSetCacheConfig(beamformKernel<DataType, false, InterpolationType::Quadratic, StorageType>, CACHE_CONFIG));
+            beamformKernel<DataType, false, InterpolationType::Quadratic, StorageType><<<grid, threads_per_block>>>(
                 d_channel_data, n_frames, n_receive_elements, n_samples,
                 d_rx_coords_m, d_scan_coords_m, d_tx_arrivals_s, d_out,
                 sampling_freq_hz, inv_sound_speed_m_s, modulation_freq_hz,
@@ -1208,6 +1236,71 @@ void beamform(
 #endif
 }
 
+/**
+ * @brief I/Q beamforming with FP16 (half2) channel-data storage.
+ *
+ * Identical math to beamform<std::complex<float>>: only the channel_data
+ * STORAGE format changes, halving global-memory traffic and footprint.
+ * Interpolation, apodization, phase rotation, and accumulation all stay FP32,
+ * and `out` stays complex64 (so callers never need a complex32 dtype).
+ *
+ * channel_data holds the complex64 data converted to interleaved float16
+ * (re, im) pairs: shape (n_rx, n_samples, 2*n_frames), passed as a uint16
+ * view. From cupy:
+ *   half = iq.view(cp.float32).astype(cp.float16).view(cp.uint16)
+ *
+ * Current restrictions: GPU arrays only (no CPU-copy path), I/Q only (an RF
+ * __half variant is symmetric in the kernel template but not yet exposed).
+ */
+void beamform_fp16(
+    nb::ndarray<const uint16_t, nb::ndim<3>, nb::c_contig> channel_data,
+    nb::ndarray<const float, nb::shape<-1, 3>, nb::c_contig> rx_coords_m,
+    nb::ndarray<const float, nb::shape<-1, 3>, nb::c_contig> scan_coords_m,
+    nb::ndarray<const float, nb::ndim<1>, nb::c_contig> tx_wave_arrivals_s,
+    nb::ndarray<std::complex<float>, nb::ndim<2>, nb::c_contig> out,
+    float f_number,
+    float rx_start_s,
+    float sampling_freq_hz,
+    float sound_speed_m_s,
+    float modulation_freq_hz,
+    float tukey_alpha,
+    InterpolationType interp_type
+) {
+    const size_t n_receive_elements = rx_coords_m.shape(0);
+    const size_t n_samples = channel_data.shape(1);
+    const size_t n_output_voxels = scan_coords_m.shape(0);
+    const size_t n_frames = out.shape(1);
+
+    if (channel_data.shape(0) != static_cast<int64_t>(n_receive_elements) ||
+        channel_data.shape(2) != static_cast<int64_t>(2 * n_frames)) {
+        throw std::runtime_error(
+            "beamform_fp16: channel_data must have shape (n_rx, n_samples, 2*n_frames) "
+            "as uint16 (an interleaved-float16 view of the complex64 data), got " +
+            shape_to_string(channel_data) + " for out.shape " + shape_to_string(out));
+    }
+    if (tx_wave_arrivals_s.shape(0) != static_cast<int64_t>(n_output_voxels) ||
+        out.shape(0) != static_cast<int64_t>(n_output_voxels)) {
+        throw std::runtime_error("beamform_fp16: scan_coords_m, tx_wave_arrivals_s, and out "
+                                 "must agree on n_output_voxels");
+    }
+    const int cpu_count = check_devices(channel_data, rx_coords_m, scan_coords_m,
+                                        tx_wave_arrivals_s, out);
+    if (cpu_count != 0) {
+        throw std::runtime_error("beamform_fp16 requires all arrays on GPU "
+                                 "(found " + std::to_string(cpu_count) + " CPU array(s))");
+    }
+
+    _beamform_impl<float2, __half2>(
+        reinterpret_cast<const __half2*>(channel_data.data()),
+        reinterpret_cast<const float3*>(rx_coords_m.data()),
+        reinterpret_cast<const float3*>(scan_coords_m.data()),
+        tx_wave_arrivals_s.data(),
+        reinterpret_cast<float2*>(out.data()),
+        n_receive_elements, n_samples, n_output_voxels, n_frames,
+        f_number, rx_start_s, sampling_freq_hz, sound_speed_m_s,
+        modulation_freq_hz, tukey_alpha, interp_type);
+}
+
 NB_MODULE(_cuda_impl, m) {
     m.doc() = "CUDA-accelerated ultrasound beamforming with nanobind";
 
@@ -1251,6 +1344,21 @@ NB_MODULE(_cuda_impl, m) {
         "sampling_freq_hz"_a,
         "sound_speed_m_s"_a,
         "modulation_freq_hz"_a = 0.0f,
+        "tukey_alpha"_a = 0.5f,
+        "interp_type"_a = InterpolationType::Linear);
+
+    // I/Q beamforming with FP16 (half2) channel-data storage (GPU arrays only)
+    m.def("beamform_fp16", &beamform_fp16,
+        "channel_data"_a.noconvert(),
+        "rx_coords_m"_a.noconvert(),
+        "scan_coords_m"_a.noconvert(),
+        "tx_wave_arrivals_s"_a.noconvert(),
+        "out"_a.noconvert(),
+        "f_number"_a,
+        "rx_start_s"_a,
+        "sampling_freq_hz"_a,
+        "sound_speed_m_s"_a,
+        "modulation_freq_hz"_a,
         "tukey_alpha"_a = 0.5f,
         "interp_type"_a = InterpolationType::Linear);
 }
