@@ -102,6 +102,7 @@ We welcome contributions! Please see [CONTRIBUTING.md](https://github.com/Forest
 
 ### Numerically validated, but looking for feedback on API
 - ✅ Coherent compounding
+- 🧪 Inverted-loop I/Q kernel (auto-dispatched, ~2x with FP16 storage) and FP16 channel-data storage via the private `mach._cuda_impl.beamform_fp16` (experimental, see [BENCHMARKS.md](BENCHMARKS.md))
 
 See the [project page](https://github.com/orgs/Forest-Neurotech/projects/14) for our up-to-date roadmap.
 We welcome [feature requests](https://github.com/Forest-Neurotech/mach/issues)!
