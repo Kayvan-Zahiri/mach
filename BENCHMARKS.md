@@ -194,3 +194,56 @@ For Maximum Throughput:
 1. **Keep data on GPU**: Use CuPy/JAX arrays to avoid CPU↔GPU transfers
 2. **Use sufficient ensemble size**: Use ≥16 frames for complex64 or ≥32 frames for float32 to fully coalesce reads to global memory
 3. **Ensure contiguous frame dimension**: The kernel requires frame-contiguous memory layouts.
+
+## Experimental: Inverted-Loop I/Q Kernel and FP16 Storage
+
+Two stacked changes, developed together because the second is what makes the first pay off.
+
+**FP16 channel-data storage** (`_cuda_impl.beamform_fp16`). Only the storage format of `channel_data` changes, to interleaved float16 (re, im) pairs passed as a `uint16` view of shape `(n_rx, n_samples, 2 * n_frames)`. Interpolation, apodization, phase rotation, accumulation, and `out` all stay float32 / complex64, so no complex32 dtype is ever needed on the Python side. Results match `beamform()` to float16 input rounding (max relative error ~2e-4 on random data, ~2e-5 on band-limited data). On its own this gave no speedup on an RTX A6000, because the original kernel is bound by load latency rather than by memory bandwidth.
+
+```python
+import cupy as cp
+from mach._cuda_impl import beamform_fp16
+
+chan16 = iq.view(cp.float32).astype(cp.float16).view(cp.uint16)  # once, 4-40 ms
+out = cp.zeros((n_voxels, n_frames), cp.complex64)
+beamform_fp16(chan16, rx_coords_m, scan_coords_m, tx_wave_arrivals_s, out,
+              f_number=1.0, rx_start_s=0.0, sampling_freq_hz=fs,
+              sound_speed_m_s=1540.0, modulation_freq_hz=f0, tukey_alpha=0.5)
+```
+
+**Inverted-loop I/Q kernel** (`beamformKernelInvIQ`). The receive-element loop moves outermost and each thread owns four consecutive frames in registers, fetched with 128-bit vector loads. Sample index, bounds check, apodization weight, and the phase-rotation `sincos` are computed once per element instead of once per (element, frame), and the serial load-then-FMA dependency chain becomes four independent accumulator streams. It is dispatched automatically for I/Q data with nearest or linear interpolation when `n_frames % 8 == 0`. RF data, quadratic interpolation, and other frame counts use the original kernel unchanged. Set `MACH_NO_INVERT=1` in the environment to force the original kernel for A/B comparisons. Results agree with the original kernel to float32 rounding (max relative error ~6e-7, the summation order differs).
+
+### Results on an RTX A6000 (Ampere, 84 SMs, 6 MB L2)
+
+128³ voxels, matrix array with 300 µm pitch, linear interpolation, no apodization, single GPU, median of 5 runs. "IQ-256" is baseband I/Q sampled at f0 with 256 samples per trace. "RF-2048" is analytic RF sampled at 40 MHz with 2048 samples per trace.
+
+| config | batch | original fp32 | inverted fp32 | inverted + fp16 | speedup |
+|---|---|---|---|---|---|
+| 1024 ch, IQ-256 | 128 | 647 ms | 417 ms (1.55x) | 331 ms | **1.96x** |
+| 1024 ch, RF-2048 | 128 | 622 ms | 553 ms (1.13x) | 345 ms | **1.80x** |
+| 4096 ch, IQ-256 | 128 | 1464 ms | 896 ms (1.63x) | 776 ms | **1.89x** |
+| 4096 ch, RF-2048 | 128 | 1447 ms | 1248 ms (1.16x) | 820 ms | **1.76x** |
+
+Batch sweep at 1024 channels (the working-set footprint grows with batch, so this is the axis most sensitive to L2 size):
+
+| config | batch 32 | batch 64 | batch 128 | batch 256 |
+|---|---|---|---|---|
+| IQ-256, inverted + fp16 vs original | 1.64x | 1.92x | 1.96x | 2.01x |
+| RF-2048, inverted + fp16 vs original | 1.48x | 1.70x | 1.80x | 1.96x |
+
+Inversion alone helps most in the short-trace I/Q regime (1.5 to 1.6x) and little on long RF traces at large batch (about 1.0x), where the restructured kernel becomes bandwidth bound. FP16 storage then halves the bytes and restores the gain, which is why the two changes are worth roughly 2x together but far less individually. Timings drift about 10% run to run with clocks and thermals, so compare ratios within one run.
+
+**Open question, GPUs with larger L2.** The A6000 has 6 MB of L2. Cards like the RTX 4090 (72 MB) and RTX 5090 (96 MB) keep far more of a tile's sample window resident, which should shift where the inverted kernel stops being latency bound and may change the fp32 / fp16 split of the gain. Numbers from those GPUs are wanted.
+
+### Reproducing on another GPU
+
+```bash
+git clone https://github.com/Forest-Neurotech/mach.git && cd mach && git checkout feat/fp16-storage
+pip install scikit-build-core nanobind cmake ninja cupy-cuda12x
+pip install --no-build-isolation .          # needs nvcc; CMakeLists targets sm_75/89/90 (+PTX)
+python tests/bench_inverted_fp16.py --check              # correctness matrix, ~10 s
+python tests/bench_inverted_fp16.py --sweep-batch --json results.json   # ~5 min, ~16 GB VRAM
+```
+
+The script prints the GPU name, L2 size, and SM count with the table. For a Blackwell card (RTX 5090, sm_120) the compute_90 PTX is JIT-compiled by the driver, or add `120` to `CMAKE_CUDA_ARCHITECTURES` in `CMakeLists.txt` with CUDA 12.8 or newer. `--el 140x40` adds a 5600-channel configuration in both regimes.
