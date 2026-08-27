@@ -1,9 +1,9 @@
 """Tests for the inverted-loop I/Q kernel and FP16 channel-data storage.
 
 The inverted kernel is auto-dispatched for I/Q data with nearest/linear
-interpolation when n_frames % 8 == 0, and can be disabled with the
-MACH_NO_INVERT environment variable, which these tests use to obtain the
-original kernel's output as the reference.
+interpolation when n_frames % 8 == 0. The ``use_inverted_kernel=False``
+keyword of the nanobind functions forces the original per-frame kernel, which
+these tests use as the reference.
 """
 
 import numpy as np
@@ -11,7 +11,7 @@ import pytest
 
 import mach
 from mach._cuda_impl import beamform_fp16
-from mach.kernel import InterpolationType
+from mach.kernel import InterpolationType, nb_beamform
 
 cp = pytest.importorskip("cupy")
 
@@ -47,14 +47,29 @@ def iq_data():
 
 
 def _beamform(data, chan, **kwargs):
+    """Public API path (auto-dispatch)."""
     return mach.beamform(
         channel_data=chan,
         rx_coords_m=data["rx"],
         scan_coords_m=data["scan"],
         tx_wave_arrivals_s=data["tx_arrivals"],
-        **BEAMFORM_KWARGS,
-        **kwargs,
+        **{**BEAMFORM_KWARGS, **kwargs},
     )
+
+
+def _beamform_original(data, chan, **kwargs):
+    """Reference: the original per-frame kernel via the nanobind function."""
+    out = cp.zeros((N_SCAN, chan.shape[2]), dtype=cp.complex64)
+    nb_beamform(
+        channel_data=chan,
+        rx_coords_m=data["rx"],
+        scan_coords_m=data["scan"],
+        tx_wave_arrivals_s=data["tx_arrivals"],
+        out=out,
+        use_inverted_kernel=False,
+        **{**BEAMFORM_KWARGS, **kwargs},
+    )
+    return out
 
 
 def _max_rel_err(a, b):
@@ -63,36 +78,57 @@ def _max_rel_err(a, b):
 
 @pytest.mark.parametrize("interp_type", [InterpolationType.NearestNeighbor, InterpolationType.Linear])
 @pytest.mark.parametrize("tukey_alpha", [0.0, 0.5])
-def test_inverted_kernel_matches_original(iq_data, monkeypatch, interp_type, tukey_alpha):
+@pytest.mark.parametrize("modulation_freq_hz", [7.8e6, 0.0])
+@pytest.mark.parametrize("n_frames", [8, 16, 24, 64])  # small counts change the block shape
+def test_inverted_kernel_matches_original(iq_data, interp_type, tukey_alpha, modulation_freq_hz, n_frames):
     """n_frames % 8 == 0 dispatches the inverted kernel; it must agree with the original to FP32 rounding."""
-    chan = cp.ascontiguousarray(iq_data["chan"][:, :, :64])
-    monkeypatch.setenv("MACH_NO_INVERT", "1")
-    reference = _beamform(iq_data, chan, tukey_alpha=tukey_alpha, interp_type=interp_type)
-    monkeypatch.delenv("MACH_NO_INVERT")
-    inverted = _beamform(iq_data, chan, tukey_alpha=tukey_alpha, interp_type=interp_type)
+    chan = cp.ascontiguousarray(iq_data["chan"][:, :, :n_frames])
+    kwargs = {"tukey_alpha": tukey_alpha, "interp_type": interp_type, "modulation_freq_hz": modulation_freq_hz}
+    reference = _beamform_original(iq_data, chan, **kwargs)
+    inverted = _beamform(iq_data, chan, **kwargs)
     assert inverted.shape == reference.shape
-    assert not cp.array_equal(inverted, reference), "inverted kernel was not dispatched (bitwise-equal output)"
+    if modulation_freq_hz != 0.0:
+        # The folded phase rotation reorders the arithmetic, so a dispatched inverted kernel is
+        # detectably (but only by rounding) different from the original.
+        assert not cp.array_equal(inverted, reference), "inverted kernel was not dispatched (bitwise-equal output)"
     assert _max_rel_err(inverted, reference) < 1e-5
 
 
+def test_use_inverted_kernel_flag_selects_original(iq_data):
+    """use_inverted_kernel=False on the nanobind function reproduces the original kernel bitwise."""
+    chan = cp.ascontiguousarray(iq_data["chan"][:, :, :64])
+    reference = _beamform_original(iq_data, chan)
+    out = cp.zeros((N_SCAN, 64), dtype=cp.complex64)
+    nb_beamform(chan, iq_data["rx"], iq_data["scan"], iq_data["tx_arrivals"], out, **BEAMFORM_KWARGS)
+    assert not cp.array_equal(out, reference)  # default dispatches the inverted kernel
+    out.fill(0)
+    nb_beamform(
+        chan, iq_data["rx"], iq_data["scan"], iq_data["tx_arrivals"], out, use_inverted_kernel=False, **BEAMFORM_KWARGS
+    )
+    assert cp.array_equal(out, reference)
+
+
 @pytest.mark.parametrize("n_frames", [50, 63])
-def test_non_multiple_of_8_frames_falls_back(iq_data, monkeypatch, n_frames):
+def test_non_multiple_of_8_frames_falls_back(iq_data, n_frames):
     """Frame counts that are not a multiple of 8 must use the original kernel (bitwise-identical output)."""
     chan = cp.ascontiguousarray(iq_data["chan"][:, :, :n_frames])
-    monkeypatch.setenv("MACH_NO_INVERT", "1")
-    reference = _beamform(iq_data, chan)
-    monkeypatch.delenv("MACH_NO_INVERT")
-    fallback = _beamform(iq_data, chan)
-    assert cp.array_equal(fallback, reference)
+    assert cp.array_equal(_beamform(iq_data, chan), _beamform_original(iq_data, chan))
 
 
-def test_quadratic_falls_back(iq_data, monkeypatch):
+def test_quadratic_falls_back(iq_data):
     chan = cp.ascontiguousarray(iq_data["chan"][:, :, :64])
-    monkeypatch.setenv("MACH_NO_INVERT", "1")
-    reference = _beamform(iq_data, chan, interp_type=InterpolationType.Quadratic)
-    monkeypatch.delenv("MACH_NO_INVERT")
-    fallback = _beamform(iq_data, chan, interp_type=InterpolationType.Quadratic)
-    assert cp.array_equal(fallback, reference)
+    kwargs = {"interp_type": InterpolationType.Quadratic}
+    assert cp.array_equal(_beamform(iq_data, chan, **kwargs), _beamform_original(iq_data, chan, **kwargs))
+
+
+def test_unaligned_view_falls_back(iq_data):
+    """A C-contiguous view whose base is not 16-byte aligned must use the original kernel, not crash."""
+    n_frames = 64
+    buf = cp.zeros(N_RX * N_SAMPLES * n_frames + 1, dtype=cp.complex64)
+    chan = buf[1:].reshape(N_RX, N_SAMPLES, n_frames)  # 8-byte offset, still C-contiguous
+    assert chan.data.ptr % 16 == 8
+    chan[...] = iq_data["chan"][:, :, :n_frames]
+    assert cp.array_equal(_beamform(iq_data, chan), _beamform_original(iq_data, chan))
 
 
 @pytest.mark.parametrize(
@@ -136,4 +172,14 @@ def test_fp16_rejects_cpu_arrays(iq_data):
     chan16 = cp.asnumpy(cp.ascontiguousarray(chan.view(cp.float32).astype(cp.float16)).view(cp.uint16))
     out = cp.zeros((N_SCAN, 64), dtype=cp.complex64)
     with pytest.raises(RuntimeError, match="GPU"):
+        beamform_fp16(chan16, iq_data["rx"], iq_data["scan"], iq_data["tx_arrivals"], out, **BEAMFORM_KWARGS)
+
+
+def test_fp16_rejects_odd_offset_view(iq_data):
+    """half2 loads need 4-byte alignment; a uint16 view at an odd element offset must be rejected up front."""
+    n_frames = 64
+    buf = cp.zeros(N_RX * N_SAMPLES * 2 * n_frames + 1, dtype=cp.uint16)
+    chan16 = buf[1:].reshape(N_RX, N_SAMPLES, 2 * n_frames)  # 2-byte offset
+    out = cp.zeros((N_SCAN, n_frames), dtype=cp.complex64)
+    with pytest.raises(RuntimeError, match="aligned"):
         beamform_fp16(chan16, iq_data["rx"], iq_data["scan"], iq_data["tx_arrivals"], out, **BEAMFORM_KWARGS)

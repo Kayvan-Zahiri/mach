@@ -4,7 +4,7 @@
 Three kernel paths are timed on the same synthetic plane-wave dataset
 (matrix array, 128^3-voxel volume, `batch` frames):
 
-  original   the baseline beamformKernel (forced with MACH_NO_INVERT=1)
+  original   the baseline per-frame beamformKernel (use_inverted_kernel=False)
   inverted   beamformKernelInvIQ with FP32 storage (the auto-dispatched default)
   inv+fp16   beamformKernelInvIQ with half2 storage (_cuda_impl.beamform_fp16)
 
@@ -21,17 +21,15 @@ Examples::
     python tests/bench_inverted_fp16.py --json results.json
 
 Memory: the largest default config (4096 ch x 2048 samples x 128 frames)
-needs ~16 GB of GPU memory; configs that do not fit are skipped and reported.
-Timings drift ~10% run to run with GPU clocks/thermals, so compare ratios
-within one run rather than absolute numbers across runs.
+needs about 18 GB of free GPU memory (a 24 GB card); configs that do not fit
+are skipped and reported. Timings drift ~10% run to run with GPU clocks and
+thermals, so compare ratios within one run rather than absolute numbers
+across runs.
 """
-
-from __future__ import annotations
 
 import argparse
 import json
 import math
-import os
 import platform
 import statistics
 import sys
@@ -54,6 +52,10 @@ DEFAULT_CONFIGS = [
 ]
 SWEEP_BATCHES = (32, 64, 128, 256)
 
+# Peak GPU memory per channel-data element and per output element, used to skip configs that do not fit
+BYTES_PER_CHANNEL_ELEMENT = 8 + 4  # complex64 data + its float16 copy
+BYTES_PER_OUTPUT_ELEMENT = 8 * 2  # complex64 output + the reference copy
+
 
 def gpu_info(dev: int = 0) -> dict:
     p = cp.cuda.runtime.getDeviceProperties(dev)
@@ -74,7 +76,7 @@ def gpu_info(dev: int = 0) -> dict:
     }
 
 
-def make_dataset(el: str, nt: int, iq: bool, batch: int, n: int):
+def make_dataset(el: str, nt: int, iq: bool, batch: int, n: int) -> dict:
     """Synthetic matrix-array plane-wave acquisition of five point scatterers."""
     fs = F0 if iq else FS_RF
     enx, eny = map(int, el.split("x"))
@@ -102,9 +104,9 @@ def make_dataset(el: str, nt: int, iq: bool, batch: int, n: int):
         tau = (s[2] + cp.linalg.norm(rx_pos - s[None, :], axis=1)) / C0
         dtau = t[None, :] - tau[:, None]
         env = cp.exp(-0.5 * (dtau / sigma) ** 2)
-        if iq:  # baseband I/Q sampled at fs = f0 (the ffdas-paper regime)
+        if iq:  # baseband I/Q sampled at fs = f0 (short traces)
             rf1 += (env * cp.exp(-2j * np.pi * F0 * tau[:, None])).astype(cp.complex64)
-        else:  # analytic RF at 40 MHz
+        else:  # analytic RF at 40 MHz (long traces)
             rf1 += (env * cp.exp(2j * np.pi * F0 * dtau)).astype(cp.complex64)
     chan = cp.ascontiguousarray(cp.broadcast_to(rf1[:, :, None], (n_ch, nt, batch)))
     del rf1
@@ -150,11 +152,13 @@ def timed(fn, rep: int) -> float:
     return statistics.median(times)
 
 
-def run_config(name, el, nt, iq, batch, n, rep, tukey, interp, do_time=True):
+def run_config(
+    name: str, el: str, nt: int, iq: bool, batch: int, n: int, rep: int, tukey: float, interp: InterpolationType
+) -> dict:
     n_vox = n**3
     enx, eny = map(int, el.split("x"))
     n_ch = enx * eny
-    need = n_ch * nt * batch * (8 + 2 + 4) + n_vox * batch * 8 * 2 + 64 * 2**20  # chan + fp16 + fp16 temp, out + ref
+    need = n_ch * nt * batch * BYTES_PER_CHANNEL_ELEMENT + n_vox * batch * BYTES_PER_OUTPUT_ELEMENT + 64 * 2**20
     free, _ = cp.cuda.Device().mem_info
     if need > 0.9 * free:
         return {"name": name, "skipped": f"needs ~{need / 2**30:.1f} GB, {free / 2**30:.1f} GB free"}
@@ -177,7 +181,11 @@ def run_config(name, el, nt, iq, batch, n, rep, tukey, interp, do_time=True):
     cp.cuda.Device().synchronize()
     convert_ms = (time.perf_counter() - t0) * 1e3
 
-    def call_fp32():
+    def call_original():
+        out.fill(0)
+        beamform(chan, rx_pos, vox, tx_arrivals, out, use_inverted_kernel=False, **kw)
+
+    def call_inverted():
         out.fill(0)
         beamform(chan, rx_pos, vox, tx_arrivals, out, **kw)
 
@@ -199,28 +207,18 @@ def run_config(name, el, nt, iq, batch, n, rep, tukey, interp, do_time=True):
     }
     pts = n_vox * n_ch * batch
 
-    os.environ["MACH_NO_INVERT"] = "1"
-    try:
-        ms = timed(call_fp32, rep) if do_time else (call_fp32() or 0.0)
-        ref = out.copy()
-        res["original_ms"] = ms
-    finally:
-        os.environ.pop("MACH_NO_INVERT", None)
-
-    for label, fn in (("inverted", call_fp32), ("inv_fp16", call_fp16)):
-        ms = timed(fn, rep) if do_time else (fn() or 0.0)
-        r, err = compare(out, ref)
-        res[f"{label}_ms"] = ms
-        res[f"{label}_r"] = r
-        res[f"{label}_max_rel_err"] = err
-    if do_time:
-        res["tpts_per_s"] = {k: pts / (res[f"{k}_ms"] * 1e-3) / 1e12 for k in ("original", "inverted", "inv_fp16")}
+    res["original_ms"] = timed(call_original, rep)
+    ref = out.copy()
+    for label, fn in (("inverted", call_inverted), ("inv_fp16", call_fp16)):
+        res[f"{label}_ms"] = timed(fn, rep)
+        res[f"{label}_r"], res[f"{label}_max_rel_err"] = compare(out, ref)
+    res["tpts_per_s"] = {k: pts / (res[f"{k}_ms"] * 1e-3) / 1e12 for k in ("original", "inverted", "inv_fp16")}
     return res  # GPU arrays are released on return; the caller drains the cupy pool
 
 
-def correctness_matrix(rep_seed: int = 1) -> list[dict]:
+def correctness_matrix(seed: int = 1) -> list[dict]:
     """Small randomized check: every interpolator x tukey x (dispatched | fallback) path."""
-    cp.random.seed(rep_seed)
+    cp.random.seed(seed)
     n_ch, nt, n_vox = 256, 512, 40000
     chan_all = (cp.random.standard_normal((n_ch, nt, 64)) + 1j * cp.random.standard_normal((n_ch, nt, 64))).astype(
         cp.complex64
@@ -248,11 +246,7 @@ def correctness_matrix(rep_seed: int = 1) -> list[dict]:
                 a = cp.zeros((n_vox, batch), cp.complex64)
                 b = cp.zeros((n_vox, batch), cp.complex64)
                 c = cp.zeros((n_vox, batch), cp.complex64)
-                os.environ["MACH_NO_INVERT"] = "1"
-                try:
-                    beamform(chan, rx, vox, arr, a, tukey_alpha=tukey, interp_type=interp, **kw)
-                finally:
-                    os.environ.pop("MACH_NO_INVERT", None)
+                beamform(chan, rx, vox, arr, a, tukey_alpha=tukey, interp_type=interp, use_inverted_kernel=False, **kw)
                 beamform(chan, rx, vox, arr, b, tukey_alpha=tukey, interp_type=interp, **kw)
                 beamform_fp16(chan16, rx, vox, arr, c, tukey_alpha=tukey, interp_type=interp, **kw)
                 r_inv, e_inv = compare(b, a)
@@ -295,7 +289,12 @@ def main(argv=None) -> int:
     ap.add_argument("--n", type=int, default=128, help="voxels per axis (default 128 -> 128^3 volume)")
     ap.add_argument("--rep", type=int, default=3, help="timed repetitions per kernel (median reported)")
     ap.add_argument("--tukey", type=float, default=0.0, help="Tukey apodization alpha (0 = none)")
-    ap.add_argument("--interp", choices=["nearest", "linear"], default="linear")
+    ap.add_argument(
+        "--interp",
+        choices=["nearest", "linear"],
+        default="linear",
+        help="interpolation (quadratic is excluded because it always uses the original kernel)",
+    )
     ap.add_argument("--configs", nargs="*", help="subset of default config names to run")
     ap.add_argument("--el", help="extra array geometry AZxEL, e.g. 140x40 (run in both regimes)")
     ap.add_argument(

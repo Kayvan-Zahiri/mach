@@ -6,8 +6,8 @@
 #include <iostream>
 #include <cmath>
 #include <complex>
+#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <optional>
 
 #include <nanobind/nanobind.h>
@@ -308,9 +308,11 @@ __device__ __forceinline__ DataType interpolate_sample(
  * @brief Load FPT consecutive frames' complex samples with one or two 128-bit
  * vector loads and convert to FP32.
  *
- * Requires 16-byte alignment of `p`, which the inverted-kernel dispatcher
- * guarantees by only engaging when n_frames is a multiple of 8 (so every
- * row offset and frame0 offset stays 16B-aligned for both storage types).
+ * Requires 16-byte alignment of `p`. The inverted-kernel dispatcher guarantees
+ * this by checking the base pointer and by only engaging when n_frames is a
+ * multiple of 8: a multiple of 4 already keeps every row offset and frame0
+ * offset 16B-aligned for both storage types, and 8 additionally guarantees at
+ * least two frame-threads per voxel.
  */
 template<typename StorageType, int FPT>
 __device__ __forceinline__ void load_frames(const StorageType* __restrict__ p, float2 (&out)[FPT]);
@@ -832,23 +834,14 @@ __global__ void beamformKernelInvIQ(
             const float sample_idx = (physical_tau_s - rx_start_s) * sampling_freq_hz;
             const uint32_t receive_element_idx = receive_element_block_start_idx + e;
 
-            // Phase rotation + apodization: once per element, folded into one
-            // complex weight (w*cos, w*sin). rot(w*s) == w*rot(s).
-            float cos_phi = 1.0f, sin_phi = 0.0f;
-            if (modulation_freq_hz != 0.0f) {
-                __sincosf(modulation_freq_rad * physical_tau_s, &sin_phi, &cos_phi);
-            }
-            const float w = UseApodization ? apod_weight : 1.0f;
-            const float cw = cos_phi * w;
-            const float sw = sin_phi * w;
-
+            // Sample bounds and loads: same conditions and rounding intrinsics as
+            // interpolate_nearest / interpolate_linear, one vector load per tap.
             float2 samp[FPT];
             if constexpr (interpType == InterpolationType::NearestNeighbor) {
                 if ((sample_idx < -0.5f) || (sample_idx > (n_samples - 0.5f))) continue;
                 const unsigned int s0 = __float2uint_rn(sample_idx);
                 load_frames<StorageType, FPT>(
-                    channel_data + (static_cast<uint32_t>(receive_element_idx) * n_samples + s0) * n_frames + frame0,
-                    samp);
+                    channel_data + (receive_element_idx * n_samples + s0) * n_frames + frame0, samp);
             } else {  // Linear
                 if ((sample_idx < 0.0f) || (sample_idx > (n_samples - 1))) continue;
                 const unsigned int sample_idx_floor = __float2uint_rd(sample_idx);
@@ -862,10 +855,25 @@ __global__ void beamformKernelInvIQ(
                 for (int k = 0; k < FPT; k++) samp[k] = lerp(lo[k], hi[k], lerp_alpha);
             }
 
-            #pragma unroll
-            for (int k = 0; k < FPT; k++) {
-                acc[k].x = fmaf(samp[k].x, cw, fmaf(-samp[k].y, sw, acc[k].x));
-                acc[k].y = fmaf(samp[k].y, cw, fmaf(samp[k].x, sw, acc[k].y));
+            // Apodization and phase rotation once per element, folded into one
+            // complex weight (w*cos, w*sin): rot(w*s) == w*rot(s).
+            const float w = UseApodization ? apod_weight : 1.0f;
+            if (modulation_freq_hz != 0.0f) {
+                float cos_phi, sin_phi;
+                __sincosf(modulation_freq_rad * physical_tau_s, &sin_phi, &cos_phi);
+                const float cw = cos_phi * w;
+                const float sw = sin_phi * w;
+                #pragma unroll
+                for (int k = 0; k < FPT; k++) {
+                    acc[k].x = fmaf(samp[k].x, cw, fmaf(-samp[k].y, sw, acc[k].x));
+                    acc[k].y = fmaf(samp[k].y, cw, fmaf(samp[k].x, sw, acc[k].y));
+                }
+            } else {
+                #pragma unroll
+                for (int k = 0; k < FPT; k++) {
+                    acc[k].x = fmaf(samp[k].x, w, acc[k].x);
+                    acc[k].y = fmaf(samp[k].y, w, acc[k].y);
+                }
             }
         }
 
@@ -882,8 +890,9 @@ __global__ void beamformKernelInvIQ(
  * @brief Launch the inverted-loop kernel if the configuration allows it.
  *
  * @return false (nothing launched) when the configuration requires the
- * original kernel: RF data, quadratic interpolation, n_frames not a multiple
- * of 8, or MACH_NO_INVERT set in the environment (A/B benchmarking).
+ * original kernel: RF data, quadratic interpolation, n_frames not a positive
+ * multiple of 8, a channel_data pointer that is not 16-byte aligned (an offset
+ * view), or use_inverted_kernel == false (A/B comparisons against the original).
  */
 template<typename DataType, typename StorageType>
 bool _try_beamform_inverted(
@@ -902,19 +911,17 @@ bool _try_beamform_inverted(
     float inv_sound_speed_m_s,
     float modulation_freq_hz,
     float tukey_alpha,
-    InterpolationType interp_type
+    InterpolationType interp_type,
+    bool use_inverted_kernel
 ) {
     if constexpr (!std::is_same_v<DataType, float2>) {
         return false;
     } else {
         constexpr int FPT = 4;
         if (interp_type == InterpolationType::Quadratic) return false;
-        if (n_frames % 8 != 0) return false;  // vector-load alignment + full FPT chunks
-        if (std::getenv("MACH_NO_INVERT") != nullptr) return false;
-        if (n_output_voxels > INT_MAX) {
-            throw std::runtime_error("Error: Number of voxels (" + std::to_string(n_output_voxels) +
-                                     ") exceeds the maximum integer value (" + std::to_string(INT_MAX) + ").");
-        }
+        if (n_frames == 0 || n_frames % 8 != 0) return false;  // full FPT chunks + 16B-aligned rows/frame0
+        if (reinterpret_cast<std::uintptr_t>(d_channel_data) % 16 != 0) return false;  // 128-bit loads need a 16B base
+        if (!use_inverted_kernel) return false;
 
         const uint32_t n_chunks = n_frames / FPT;
         const int frame_threads = min(static_cast<int>(n_chunks), MAX_FRAME_THREADS_PER_BLOCK);
@@ -931,23 +938,23 @@ bool _try_beamform_inverted(
         dim3 grid(grid_x, grid_y, grid_z);
 
         const bool apod_flag = tukey_alpha > 0.0f;
+        const bool nearest = interp_type == InterpolationType::NearestNeighbor;
 
-#define MACH_LAUNCH_INV(APOD, INTERP)                                                      \
-        beamformKernelInvIQ<StorageType, APOD, INTERP, FPT><<<grid, threads_per_block>>>(  \
-            d_channel_data, n_frames, n_receive_elements, n_samples,                       \
-            d_rx_coords_m, d_scan_coords_m, d_tx_arrivals_s, d_out,                        \
-            sampling_freq_hz, inv_sound_speed_m_s, modulation_freq_hz,                     \
-            f_number, tukey_alpha, rx_start_s, n_output_voxels,                            \
-            receive_elements_batch_size)
+        auto launch = [&](auto kernel) {
+            checkCudaErrors(cudaFuncSetCacheConfig(kernel, CACHE_CONFIG));
+            kernel<<<grid, threads_per_block>>>(
+                d_channel_data, n_frames, n_receive_elements, n_samples,
+                d_rx_coords_m, d_scan_coords_m, d_tx_arrivals_s, d_out,
+                sampling_freq_hz, inv_sound_speed_m_s, modulation_freq_hz,
+                f_number, tukey_alpha, rx_start_s, n_output_voxels,
+                receive_elements_batch_size);
+            checkCudaErrors(cudaGetLastError());
+        };
+        if (apod_flag && nearest)       launch(beamformKernelInvIQ<StorageType, true,  InterpolationType::NearestNeighbor, FPT>);
+        else if (apod_flag)             launch(beamformKernelInvIQ<StorageType, true,  InterpolationType::Linear,          FPT>);
+        else if (nearest)               launch(beamformKernelInvIQ<StorageType, false, InterpolationType::NearestNeighbor, FPT>);
+        else                            launch(beamformKernelInvIQ<StorageType, false, InterpolationType::Linear,          FPT>);
 
-        if (apod_flag) {
-            if (interp_type == InterpolationType::NearestNeighbor) MACH_LAUNCH_INV(true, InterpolationType::NearestNeighbor);
-            else                                                   MACH_LAUNCH_INV(true, InterpolationType::Linear);
-        } else {
-            if (interp_type == InterpolationType::NearestNeighbor) MACH_LAUNCH_INV(false, InterpolationType::NearestNeighbor);
-            else                                                   MACH_LAUNCH_INV(false, InterpolationType::Linear);
-        }
-#undef MACH_LAUNCH_INV
         // Wait for kernel to complete
         checkCudaErrors(cudaDeviceSynchronize());
         return true;
@@ -1002,7 +1009,8 @@ void _beamform_impl(
     float sound_speed_m_s,
     float modulation_freq_hz,
     float tukey_alpha,
-    InterpolationType interp_type
+    InterpolationType interp_type,
+    bool use_inverted_kernel
 ) {
 #ifdef CUDA_PROFILE
     TIME_FUNCTION();
@@ -1020,6 +1028,10 @@ void _beamform_impl(
         throw std::runtime_error("Error: tukey_alpha must be in range [0, 1], but got " +
                                 std::to_string(tukey_alpha));
     }
+    if (n_output_voxels > INT_MAX) {
+        throw std::runtime_error("Error: Number of voxels (" + std::to_string(n_output_voxels) +
+                                 ") exceeds the maximum integer value (" + std::to_string(INT_MAX) + ").");
+    }
     bool apod_flag = tukey_alpha > 0.0f;
     const float inv_sound_speed_m_s = 1.0f / sound_speed_m_s;
 
@@ -1029,7 +1041,7 @@ void _beamform_impl(
             d_channel_data, d_rx_coords_m, d_scan_coords_m, d_tx_arrivals_s, d_out,
             n_receive_elements, n_samples, n_output_voxels, n_frames,
             f_number, rx_start_s, sampling_freq_hz, inv_sound_speed_m_s,
-            modulation_freq_hz, tukey_alpha, interp_type)) {
+            modulation_freq_hz, tukey_alpha, interp_type, use_inverted_kernel)) {
         return;
     }
 
@@ -1047,10 +1059,6 @@ void _beamform_impl(
 #endif
 
     // Calculate grid dimension - each block processes voxels_per_block voxels
-    if (n_output_voxels > INT_MAX) {
-        throw std::runtime_error("Error: Number of voxels (" + std::to_string(n_output_voxels) +
-                                 ") exceeds the maximum integer value (" + std::to_string(INT_MAX) + ").");
-    }
     const int num_blocks = (n_output_voxels + voxels_per_block - 1) / voxels_per_block;
     const int max_blocks_per_dim = (1 << 16) - 32; // 2**16 - 32 is the max, CUDA recommends multiples of 32
 
@@ -1326,7 +1334,8 @@ void beamform(
     float sound_speed_m_s,
     float modulation_freq_hz,
     float tukey_alpha,
-    InterpolationType interp_type
+    InterpolationType interp_type,
+    bool use_inverted_kernel
 ) {
 #ifdef CUDA_PROFILE
     TIME_FUNCTION();
@@ -1360,13 +1369,15 @@ void beamform(
             float2* d_out = reinterpret_cast<float2*>(out.data());
             _beamform_impl<float2>(d_channel_data, d_rx_coords_m, d_scan_coords_m, d_tx_arrivals_s, d_out,
                 n_receive_elements, n_samples, n_output_voxels, n_frames,
-                f_number, rx_start_s, sampling_freq_hz, sound_speed_m_s, modulation_freq_hz, tukey_alpha, interp_type);
+                f_number, rx_start_s, sampling_freq_hz, sound_speed_m_s, modulation_freq_hz, tukey_alpha, interp_type,
+                use_inverted_kernel);
         } else if constexpr (std::is_same_v<DataType, float>) {
             const float* d_channel_data = channel_data.data();
             float* d_out = out.data();
             _beamform_impl<float>(d_channel_data, d_rx_coords_m, d_scan_coords_m, d_tx_arrivals_s, d_out,
                 n_receive_elements, n_samples, n_output_voxels, n_frames,
-                f_number, rx_start_s, sampling_freq_hz, sound_speed_m_s, modulation_freq_hz, tukey_alpha, interp_type);
+                f_number, rx_start_s, sampling_freq_hz, sound_speed_m_s, modulation_freq_hz, tukey_alpha, interp_type,
+                use_inverted_kernel);
         }
         return;
     }
@@ -1453,7 +1464,8 @@ void beamform(
             sound_speed_m_s,
             modulation_freq_hz,
             tukey_alpha,
-            interp_type
+            interp_type,
+            use_inverted_kernel
         );
     } else if constexpr (std::is_same_v<DataType, float>) {
         _beamform_impl<float>(
@@ -1472,7 +1484,8 @@ void beamform(
             sound_speed_m_s,
             modulation_freq_hz,
             tukey_alpha,
-            interp_type
+            interp_type,
+            use_inverted_kernel
         );
     }
 #ifdef CUDA_PROFILE
@@ -1505,6 +1518,11 @@ void beamform(
  * view. From cupy:
  *   half = iq.view(cp.float32).astype(cp.float16).view(cp.uint16)
  *
+ * `out` is accumulated into with atomicAdd and must be zero-initialised by the
+ * caller. float16 holds |x| <= 65504 with ~3 significant digits, so scale raw
+ * ADC counts before converting. use_inverted_kernel=false forces the original
+ * per-frame kernel (for A/B comparisons); see _try_beamform_inverted.
+ *
  * Current restrictions: GPU arrays only (no CPU-copy path), I/Q only (an RF
  * __half variant is symmetric in the kernel template but not yet exposed).
  */
@@ -1520,7 +1538,8 @@ void beamform_fp16(
     float sound_speed_m_s,
     float modulation_freq_hz,
     float tukey_alpha,
-    InterpolationType interp_type
+    InterpolationType interp_type,
+    bool use_inverted_kernel
 ) {
     const size_t n_receive_elements = rx_coords_m.shape(0);
     const size_t n_samples = channel_data.shape(1);
@@ -1545,6 +1564,10 @@ void beamform_fp16(
         throw std::runtime_error("beamform_fp16 requires all arrays on GPU "
                                  "(found " + std::to_string(cpu_count) + " CPU array(s))");
     }
+    if (reinterpret_cast<std::uintptr_t>(channel_data.data()) % alignof(__half2) != 0) {
+        throw std::runtime_error("beamform_fp16: channel_data must be 4-byte aligned "
+                                 "(is it an odd-offset view of a uint16 buffer?)");
+    }
 
     _beamform_impl<float2, __half2>(
         reinterpret_cast<const __half2*>(channel_data.data()),
@@ -1554,7 +1577,7 @@ void beamform_fp16(
         reinterpret_cast<float2*>(out.data()),
         n_receive_elements, n_samples, n_output_voxels, n_frames,
         f_number, rx_start_s, sampling_freq_hz, sound_speed_m_s,
-        modulation_freq_hz, tukey_alpha, interp_type);
+        modulation_freq_hz, tukey_alpha, interp_type, use_inverted_kernel);
 }
 
 NB_MODULE(_cuda_impl, m) {
@@ -1587,7 +1610,8 @@ NB_MODULE(_cuda_impl, m) {
         "sound_speed_m_s"_a,
         "modulation_freq_hz"_a,
         "tukey_alpha"_a = 0.5f,
-        "interp_type"_a = InterpolationType::Linear);
+        "interp_type"_a = InterpolationType::Linear,
+        "use_inverted_kernel"_a = true);
 
     m.def("beamform", &beamform<float>,
         "channel_data"_a.noconvert(),
@@ -1601,10 +1625,16 @@ NB_MODULE(_cuda_impl, m) {
         "sound_speed_m_s"_a,
         "modulation_freq_hz"_a = 0.0f,
         "tukey_alpha"_a = 0.5f,
-        "interp_type"_a = InterpolationType::Linear);
+        "interp_type"_a = InterpolationType::Linear,
+        "use_inverted_kernel"_a = true);
 
-    // I/Q beamforming with FP16 (half2) channel-data storage (GPU arrays only)
     m.def("beamform_fp16", &beamform_fp16,
+        "I/Q beamforming with FP16 (half2) channel-data storage (GPU arrays only).\n\n"
+        "channel_data is the complex64 data as interleaved float16 (re, im) pairs viewed as "
+        "uint16, shape (n_rx, n_samples, 2 * n_frames): "
+        "iq.view(cp.float32).astype(cp.float16).view(cp.uint16). "
+        "Compute and out stay float32 / complex64; out is accumulated into and must be "
+        "zero-initialised by the caller.",
         "channel_data"_a.noconvert(),
         "rx_coords_m"_a.noconvert(),
         "scan_coords_m"_a.noconvert(),
@@ -1616,5 +1646,6 @@ NB_MODULE(_cuda_impl, m) {
         "sound_speed_m_s"_a,
         "modulation_freq_hz"_a,
         "tukey_alpha"_a = 0.5f,
-        "interp_type"_a = InterpolationType::Linear);
+        "interp_type"_a = InterpolationType::Linear,
+        "use_inverted_kernel"_a = true);
 }
