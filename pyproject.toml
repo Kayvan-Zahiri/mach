@@ -1,5 +1,5 @@
 [build-system]
-requires = ["scikit-build-core>=0.10", "nanobind>=2.7"]
+requires = ["scikit-build-core>=0.10", "nanobind>=3.0.1,<4"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -89,7 +89,7 @@ profile = [
 ]
 build = [
     "scikit-build-core>=0.10",
-    "nanobind>=2.7",
+    "nanobind>=3.0.1,<4",
     "cmake >=3.26.4",
     "ninja >=1.11.1",
 ]
@@ -236,7 +236,7 @@ build = [
 # build-requires explicitly.
 # because cibuildwheel uses Docker, we also need to use --system
 before-build = [
-    "uv pip install --system scikit-build-core>=0.10 nanobind>=2.7 ninja"
+    "uv pip install --system 'scikit-build-core>=0.10' 'nanobind>=3.0.1,<4' ninja"
 ]
 # Need --no-isolation to find nvcc
 build-frontend = { name = "build[uv]", args = ["--no-isolation"] }

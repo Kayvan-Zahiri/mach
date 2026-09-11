@@ -43,7 +43,7 @@ install-python-dep: ## Installs the Python dependencies
 compile: check-system-dep ## Compiles the CUDA extension with nanobind
 	@echo "Compiling CUDA extension with nanobind..."
 	@echo "If you get an scikit-build-core error, you may need to 'uv cache clean' and 'trash build/'"
-	uv pip install scikit-build-core nanobind ninja cmake
+	uv pip install scikit-build-core 'nanobind>=3.0.1,<4' ninja cmake
 	uv sync --group build
 	# Not sure if the pip command is also needed
 	uv pip install -ve . --no-build-isolation
