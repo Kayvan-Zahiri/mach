@@ -352,14 +352,20 @@ static __device__ __forceinline__ float tukey_apod_weight(float r_norm, float al
  * @brief Check CUDA driver compatibility and warn if incompatible
  *
  * This function checks if the installed CUDA driver is compatible with the
- * NVCC version used to compile this module. Issues a warning if incompatible.
+ * NVCC version used to compile this module. Issues a warning if no driver is
+ * found or if the driver is incompatible.
  */
 static void checkCudaDriverCompatibility() {
     int driverVersion = 0;
 
-    // Get driver version - if this fails, let later CUDA operations handle the error
-    if (cudaDriverGetVersion(&driverVersion) != cudaSuccess) {
-        PyErr_WarnEx(PyExc_RuntimeWarning, "Could not get CUDA driver version", 1);
+    if (cudaDriverGetVersion(&driverVersion) != cudaSuccess || driverVersion == 0) {
+        // cudaDriverGetVersion reports 0 when no driver is installed
+        if (PyErr_WarnEx(
+                PyExc_RuntimeWarning,
+                "[mach] No NVIDIA driver was found. CUDA beamforming is unavailable.",
+                1) < 0) {
+            throw nb::python_error();
+        }
         return;
     }
 
@@ -384,7 +390,9 @@ static void checkCudaDriverCompatibility() {
         "→ Please update your NVIDIA driver to version " +
         std::to_string(nvccMajor) + "." + std::to_string(nvccMinor) + " or newer.";
 
-    PyErr_WarnEx(PyExc_RuntimeWarning, warning_msg.c_str(), 1);
+    if (PyErr_WarnEx(PyExc_RuntimeWarning, warning_msg.c_str(), 1) < 0) {
+        throw nb::python_error();
+    }
 }
 
 /**
@@ -418,7 +426,9 @@ static void checkComputeCapability() {
             std::to_string(MIN_CC_MAJOR) + "." + std::to_string(MIN_CC_MINOR) +
             ". Kernels may fail to load.";
 
-        PyErr_WarnEx(PyExc_RuntimeWarning, warning_msg.c_str(), 1);
+        if (PyErr_WarnEx(PyExc_RuntimeWarning, warning_msg.c_str(), 1) < 0) {
+            throw nb::python_error();
+        }
     }
 }
 
