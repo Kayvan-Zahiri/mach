@@ -80,6 +80,21 @@ benchmark: ## Runs benchmarking comparisons
 	@echo "🚀 Running benchmarking comparisons"
 	uv run --group test --group array --group compare pytest tests -v -s --benchmark-only --benchmark-histogram --benchmark-autosave --benchmark-save-data
 
+# pytest-benchmark JSON to compare against (CI downloads it from a pinned release), and the
+# --benchmark-compare-fail expression that counts as a regression.
+BENCHMARK_BASELINE ?= benchmark-baseline.json
+BENCHMARK_REGRESSION_THRESHOLD ?= median:25%
+
+.PHONY: benchmark-compare
+benchmark-compare: ## Runs benchmarks and fails if they regressed against BENCHMARK_BASELINE
+	@if [ -f "$(BENCHMARK_BASELINE)" ]; then \
+		echo "🚀 Comparing against $(BENCHMARK_BASELINE), failing on a $(BENCHMARK_REGRESSION_THRESHOLD) regression"; \
+		uv run --group test --group array --group compare pytest tests -v -s --benchmark-only --benchmark-histogram --benchmark-autosave --benchmark-save-data --benchmark-compare="$(BENCHMARK_BASELINE)" --benchmark-compare-fail=$(BENCHMARK_REGRESSION_THRESHOLD); \
+	else \
+		echo "No baseline at $(BENCHMARK_BASELINE); recording a run without a regression check"; \
+		$(MAKE) --no-print-directory benchmark; \
+	fi
+
 .PHONY: profile
 profile: ## Runs Python test with simple profiling. Recommend using Nsight Compute or Nsight Systems for more detailed profiling.
 	@echo "Building with CUDA_PROFILE"

@@ -26,6 +26,11 @@ defaults:
   run:
     shell: bash
 
+env:
+  # Release whose attached benchmark JSON is the regression baseline.
+  # Bump it after publishing a release that has benchmark results attached.
+  BENCHMARK_BASELINE_TAG: v0.2.0
+
 jobs:
   test-gpu:
     strategy:
@@ -55,7 +60,46 @@ jobs:
         run: make test
 
 
+  benchmark-baseline:
+    # Releases record results for upload_benchmark without a regression check
+    if: github.event_name != 'release'
+    # The GPU runner image was reported in 2025 to lack gh (actions/runner-images#12398)
+    runs-on: ubuntu-22.04
+    outputs:
+      found: ${{ steps.download.outputs.found }}
+
+    steps:
+      - name: Download benchmark baseline
+        id: download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A tag with no release fails here; a release without a benchmark JSON only warns
+          assets=$(gh release view "$BENCHMARK_BASELINE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name') \
+            || { echo "::error::Could not read the release for BENCHMARK_BASELINE_TAG=$BENCHMARK_BASELINE_TAG"; exit 1; }
+          json=$(grep -E '\.json$' <<< "$assets" || true)
+          count=$(grep -c . <<< "$json" || true)
+          if [ "$count" -gt 1 ]; then
+            echo "::error::Release $BENCHMARK_BASELINE_TAG has more than one JSON asset: $(tr '\n' ' ' <<< "$json")"
+            exit 1
+          elif [ "$count" -eq 1 ]; then
+            gh release download "$BENCHMARK_BASELINE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$json" --output benchmark-baseline.json
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $BENCHMARK_BASELINE_TAG has no benchmark JSON"
+          fi
+
+      - name: Upload benchmark baseline
+        if: steps.download.outputs.found == 'true'
+        uses: actions/upload-artifact@v5
+        with:
+          name: benchmark-baseline
+          path: benchmark-baseline.json
+
   benchmark:
+    needs: benchmark-baseline
+    # Runs on releases, where benchmark-baseline is skipped, and when the baseline lookup succeeded
+    if: ${{ !cancelled() && (github.event_name == 'release' || needs.benchmark-baseline.result == 'success') }}
     strategy:
       matrix:
         python-version: ["3.11"]
@@ -79,18 +123,54 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Download benchmark baseline
+        if: needs.benchmark-baseline.outputs.found == 'true'
+        uses: actions/download-artifact@v6
+        with:
+          name: benchmark-baseline
+
+      - name: Warn about a missing benchmark baseline
+        if: github.event_name != 'release' && needs.benchmark-baseline.outputs.found != 'true'
+        run: |
+          msg="Benchmark baseline missing: release $BENCHMARK_BASELINE_TAG has no benchmark JSON, so this run is not checked for regressions."
+          echo "::warning::$msg"
+          echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run CUDA benchmark
-        run: make benchmark
+        # Without benchmark-baseline.json this records a run without comparing
+        run: make benchmark-compare BENCHMARK_BASELINE=benchmark-baseline.json
+
+      - name: Check which benchmarks the baseline covers
+        if: always() && hashFiles('benchmark-baseline.json') != '' && hashFiles('.benchmarks/*/*.json') != ''
+        run: |
+          uv run --no-sync python - <<'EOF'
+          import glob, json
+
+          def names(file):
+              return {b["fullname"] for b in json.load(open(file))["benchmarks"]}
+
+          current = names(glob.glob(".benchmarks/*/*.json")[0])
+          baseline = names("benchmark-baseline.json")
+          if not current & baseline:
+              print("::error::No benchmark from this run is in the baseline, so nothing was checked for regressions")
+              raise SystemExit(1)
+          if current - baseline:
+              print("::warning::Not in the baseline, so not checked for regressions: " + ", ".join(sorted(current - baseline)))
+          EOF
 
       - name: Plot benchmark (runtime)
+        # Keep the results when the regression check fails the job
+        if: always() && hashFiles('.benchmarks/**') != ''
         run:
           uv run --group compare tests/plot_benchmark.py --output .benchmarks/benchmark.png
 
       - name: Plot benchmark (throughput)
+        if: always() && hashFiles('.benchmarks/**') != ''
         run:
           uv run --group compare tests/plot_benchmark.py --points-per-second --output .benchmarks/benchmark_pps.png
 
       - name: Upload benchmark results
+        if: always() && hashFiles('.benchmarks/**') != ''
         uses: actions/upload-artifact@v5
         with:
           name: benchmark-results

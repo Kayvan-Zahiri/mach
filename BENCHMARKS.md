@@ -72,6 +72,28 @@ uv run --group compare tests/plot_benchmark.py --points-per-second --output asse
 
 The benchmark job in our CI pipeline ([`test_gpu.yml`](https://github.com/Forest-Neurotech/mach/blob/main/.github/workflows/test_gpu.yml)) automatically runs these benchmarks (on a T4 GPU) across different commits and releases, providing continuous performance monitoring.
 
+### Regression checking
+
+`make benchmark-compare` runs the same benchmarks as `make benchmark` and fails when a median runtime is more than 25% slower than a saved pytest-benchmark JSON file:
+
+```bash
+# Compare against a JSON saved under .benchmarks/ by an earlier run
+make benchmark-compare BENCHMARK_BASELINE=path/to/earlier-run.json
+
+# Use a tighter threshold
+make benchmark-compare BENCHMARK_BASELINE=path/to/earlier-run.json BENCHMARK_REGRESSION_THRESHOLD=median:10%
+```
+
+If the baseline file does not exist, the target records a run without comparing.
+Only benchmarks that also appear in the baseline are checked.
+In CI, the others are listed in a warning, and the job fails if no benchmark from the run is in the baseline.
+pytest-benchmark warns that `machine_info` is different when any field of it differs from the baseline, host name included, and still runs the comparison.
+
+In CI, the baseline is the benchmark JSON attached to the GitHub release named by `BENCHMARK_BASELINE_TAG` in [`test_gpu.yml`](https://github.com/Forest-Neurotech/mach/blob/main/.github/workflows/test_gpu.yml), so every run compares against the same results until the tag is bumped.
+Publishing a release runs the benchmark without the regression check and attaches the results to that release; to make them the new baseline, set `BENCHMARK_BASELINE_TAG` to that release's tag.
+If the pinned release has no benchmark JSON, the benchmark job records its results without a regression check and shows a warning, also written to the job summary.
+If `BENCHMARK_BASELINE_TAG` names no release, the release has more than one JSON asset, or the lookup fails for another reason, the `benchmark-baseline` job fails and the benchmark job does not run.
+
 ## CUDA Optimizations
 
 mach optimizes GPU memory access patterns to improve performance. For those interested in learning more about CUDA optimization, excellent resources include:
