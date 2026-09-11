@@ -56,7 +56,8 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --generate-line-info")
 # arch avoids relying on PTX JIT at load time -- a JIT only happens when no
 # cubin matches the device, and it requires a driver at least as new as the
 # build toolkit.
-set(CMAKE_CUDA_ARCHITECTURES 75 89 90)
+# https://developer.nvidia.com/cuda/gpus
+set(CMAKE_CUDA_ARCHITECTURES 75 80 86 89 90)
 
 # nanobind requires GCC 8+
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
