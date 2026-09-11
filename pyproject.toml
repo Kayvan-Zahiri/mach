@@ -212,6 +212,7 @@ preview = true
 [tool.pytest.ini_options]
 filterwarnings = [
     "error",  # make warnings errors
+    "ignore:.*No NVIDIA driver was found.*:RuntimeWarning",
     "ignore:.*This will add latency due to CPU<->GPU memory transfers.*:UserWarning",
     # vbeam warnings
     "ignore:point_position will be overwritten by the scan.:UserWarning",
